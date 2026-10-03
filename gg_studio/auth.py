@@ -30,12 +30,26 @@ def load_accounts(path: str = "accounts.json") -> list[Account]:
         )
 
     with open(p) as f:
-        data = json.load(f)
+        raw = json.load(f)
+
+    # Normalize to list of {"name":..., "cookies": {str: str}}
+    if isinstance(raw, list):
+        data = raw
+    elif "accounts" in raw:
+        data = raw["accounts"]
+    elif "url" in raw and "cookies" in raw:
+        data = [{"name": "main", "cookies": raw["cookies"]}]
+    else:
+        data = [raw]
 
     accounts: list[Account] = []
     for i, entry in enumerate(data):
         name = entry.get("name", f"account-{i + 1}")
         cookies = entry.get("cookies", {})
+
+        if isinstance(cookies, list) and cookies and isinstance(cookies[0], dict):
+            cookies = {c["name"]: c["value"] for c in cookies}
+            entry["cookies"] = cookies
 
         missing = [c for c in REQUIRED_COOKIES if c not in cookies or not cookies[c]]
         if missing:

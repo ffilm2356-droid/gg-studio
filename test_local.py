@@ -31,9 +31,32 @@ async def main():
     with open(accounts_path) as f:
         data = json.load(f)
 
-    acct_data = data[0]
+    # Support multiple formats:
+    #   1. [{"name": ..., "cookies": {...}}]           (list of accounts)
+    #   2. {"accounts": [{"name": ..., "cookies": ...}]}
+    #   3. {"url": ..., "cookies": [...]}              (raw cookie export)
+    #   4. {"name": ..., "cookies": {...}}             (single account)
+    if isinstance(data, list):
+        acct_data = data[0]
+    elif "accounts" in data:
+        acct_data = data["accounts"][0]
+    elif "url" in data and "cookies" in data:
+        cookie_list = data["cookies"]
+        if isinstance(cookie_list, list) and cookie_list and isinstance(cookie_list[0], dict):
+            cookies = {c["name"]: c["value"] for c in cookie_list}
+        else:
+            cookies = cookie_list
+        acct_data = {"name": "main", "cookies": cookies}
+    else:
+        acct_data = data
+
+    # If cookies is a list of {name, value} objects, convert to dict
+    raw_cookies = acct_data.get("cookies", {})
+    if isinstance(raw_cookies, list) and raw_cookies and isinstance(raw_cookies[0], dict):
+        acct_data["cookies"] = {c["name"]: c["value"] for c in raw_cookies}
+
     account = Account(
-        name=acct_data["name"],
+        name=acct_data.get("name", "main"),
         cookies=acct_data["cookies"],
         proxy=acct_data.get("proxy"),
     )
