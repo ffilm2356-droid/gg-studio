@@ -115,15 +115,17 @@ class GoogleAIClient:
 
     def _build_grpc_headers(self) -> dict[str, str]:
         sapisid = self.account.cookies.get("SAPISID", "")
+        if not sapisid:
+            sapisid = self.account.cookies.get("__Secure-3PAPISID", "")
         cookie_str = "; ".join(f"{k}={v}" for k, v in self.account.cookies.items())
         headers = {
             "Authorization": _sapisidhash(sapisid) if sapisid else "",
-            "X-Goog-Api-Key": _get_api_key(),
             "X-Goog-Authuser": "0",
             "Content-Type": "application/json",
             "Origin": ORIGIN,
             "Referer": f"{ORIGIN}/",
             "Cookie": cookie_str,
+            "X-Goog-Ext-353267353-Jspb": "",
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "

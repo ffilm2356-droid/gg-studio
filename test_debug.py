@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""Diagnostic test — run locally to debug auth issues."""
+"""Diagnostic test — run locally to debug auth issues.
+
+Tests multiple auth strategies to find what works:
+  1. Public API with API key (list models)
+  2. MakerSuiteService with cookies + SAPISIDHASH only (NO API key)
+  3. MakerSuiteService with cookies + API key (expect 401)
+  4. aistudio.google.com proxy endpoint
+  5. Public API image generation (check quota)
+"""
 
 import hashlib
 import json
 import os
-import ssl
 import time
 import urllib.request
 from pathlib import Path
@@ -50,14 +57,15 @@ def sapisidhash(sapisid, origin="https://aistudio.google.com"):
 
 def test_request(url, headers, data=None, label=""):
     print(f"\n--- {label} ---")
-    print(f"URL: {url[:100]}")
+    print(f"URL: {url[:120]}")
     try:
         if data is not None:
             req = urllib.request.Request(url, data=json.dumps(data).encode(), method="POST")
         else:
             req = urllib.request.Request(url)
         for k, v in headers.items():
-            req.add_header(k, v)
+            if v:
+                req.add_header(k, v)
 
         resp = urllib.request.urlopen(req, timeout=15)
         body = resp.read().decode()
@@ -92,6 +100,10 @@ def main():
     print(f"\nAPI key: {'found (' + str(len(api_key)) + ' chars)' if api_key else 'MISSING'}")
 
     sapisid = cookies.get("SAPISID", "")
+    if not sapisid:
+        sapisid = cookies.get("__Secure-3PAPISID", "")
+        if sapisid:
+            print(f"\n  Using __Secure-3PAPISID as fallback ({len(sapisid)} chars)")
     cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
 
     # Test 1: Public Gemini API — list models (just verifies API key works)
@@ -102,7 +114,7 @@ def main():
             label="Test 1: Public API - list models (API key)",
         )
 
-    # Test 2: MakerSuiteService on clients6.google.com with cookies only
+    # Test 2: MakerSuiteService with cookies + SAPISIDHASH only (NO API key!)
     grpc_url = (
         "https://alkalimakersuite-pa.clients6.google.com"
         "/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService"
@@ -115,6 +127,7 @@ def main():
         "Origin": "https://aistudio.google.com",
         "Referer": "https://aistudio.google.com/",
         "X-Goog-Authuser": "0",
+        "X-Goog-Ext-353267353-Jspb": "",
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -122,15 +135,36 @@ def main():
         ),
     }
     test_request(grpc_url, headers_cookies_only, data={},
-                 label="Test 2: MakerSuiteService - cookies + SAPISIDHASH (no API key)")
+                 label="Test 2: MakerSuiteService - cookies + SAPISIDHASH (NO API key)")
 
-    # Test 3: MakerSuiteService with cookies + API key
+    # Test 3: MakerSuiteService with cookies + API key (this SHOULD fail with 401)
     if api_key:
-        headers_full = {**headers_cookies_only, "X-Goog-Api-Key": api_key}
-        test_request(grpc_url, headers_full, data={},
-                     label="Test 3: MakerSuiteService - cookies + SAPISIDHASH + API key")
+        headers_with_key = {**headers_cookies_only, "X-Goog-Api-Key": api_key}
+        test_request(grpc_url, headers_with_key, data={},
+                     label="Test 3: MakerSuiteService + API key (expect 401 - keys not supported)")
 
-    # Test 4: Try public API for image gen (to check quota)
+    # Test 4: Try via aistudio.google.com proxy (browser may route through here)
+    aistudio_grpc_url = (
+        "https://aistudio.google.com"
+        "/api/content.AlkaliMakerSuiteService/CheckUserStatus"
+    )
+    headers_aistudio = {
+        "Content-Type": "application/json",
+        "Cookie": cookie_str,
+        "Authorization": sapisidhash(sapisid, "https://aistudio.google.com") if sapisid else "",
+        "Origin": "https://aistudio.google.com",
+        "Referer": "https://aistudio.google.com/",
+        "X-Goog-Authuser": "0",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+    }
+    test_request(aistudio_grpc_url, headers_aistudio, data={},
+                 label="Test 4: aistudio.google.com proxy endpoint")
+
+    # Test 5: Try public API for image gen (to check quota)
     if api_key:
         img_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key={api_key}"
         img_body = {
@@ -138,11 +172,14 @@ def main():
             "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
         }
         result = test_request(img_url, {"Content-Type": "application/json"}, data=img_body,
-                              label="Test 4: Public API - image gen (gemini-2.5-flash-image)")
+                              label="Test 5: Public API - image gen (gemini-2.5-flash-image)")
         if result:
             print("\n*** IMAGE GENERATION WORKS ON PUBLIC API! ***")
 
     print("\n=== Diagnostic complete ===")
+    print("\nNOTE: Test 2 is the critical one.")
+    print("If Test 2 fails with 403 'unregistered callers', your cookies may be expired.")
+    print("If Test 2 succeeds, the fix is working — API key was causing the 401.")
 
 
 if __name__ == "__main__":
