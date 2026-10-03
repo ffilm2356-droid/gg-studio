@@ -1,15 +1,16 @@
-"""Core API client — dual-backend for Google AI Studio.
+"""Core API client — triple-backend for Google AI Studio.
 
-Backend 1 (default): Public Gemini API at generativelanguage.googleapis.com
+Backend 1 (grpc + OAuth2): MakerSuiteService gRPC-web at
+  alkalimakersuite-pa.clients6.google.com
+  - Requires OAuth2 access token (obtained from session cookies)
+  - Full access to all models including Imagen 4, Veo 3
+
+Backend 2 (public): Public Gemini API at generativelanguage.googleapis.com
   - Works everywhere, requires API key
   - Set AISTUDIO_API_KEY or GEMINI_API_KEY env var
+  - May have quota limits on free tier
 
-Backend 2 (fallback/local): MakerSuiteService gRPC-web at
-  alkalimakersuite-pa.clients6.google.com
-  - Cookie-based auth (SAPISIDHASH), same as browser
-  - Only works when the host is reachable (local machine, VPN)
-
-The client auto-detects which backend to use based on what's configured.
+The client auto-acquires OAuth2 tokens from cookies when possible.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ except ImportError:
     ProxyConnector = None  # type: ignore
 
 from .auth import get_auth_headers
+from .oauth import OAuthTokenManager
 from .models import (
     ASPECT_RATIO_MAP,
     MODEL_CONFIG,
@@ -100,6 +102,8 @@ class GoogleAIClient:
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self._session: Optional[aiohttp.ClientSession] = None
         self._force_backend = force_backend  # "public" or "grpc"
+        self._oauth = OAuthTokenManager(account.cookies)
+        self._oauth_token: str | None = None
 
     @property
     def _use_public_api(self) -> bool:
@@ -107,31 +111,56 @@ class GoogleAIClient:
             return False
         if self._force_backend == "public":
             return True
+        if self._oauth_token:
+            return False
         return bool(_get_api_key())
+
+    async def ensure_oauth_token(self) -> str | None:
+        """Acquire OAuth2 token (blocking I/O, run once at startup)."""
+        if self._oauth_token:
+            return self._oauth_token
+        token = self._oauth.get_token()
+        if token:
+            self._oauth_token = token
+            logger.info("OAuth2 token acquired (%d chars)", len(token))
+        return token
 
     # ------------------------------------------------------------------
     # Headers
     # ------------------------------------------------------------------
 
     def _build_grpc_headers(self) -> dict[str, str]:
-        sapisid = self.account.cookies.get("SAPISID", "")
-        if not sapisid:
-            sapisid = self.account.cookies.get("__Secure-3PAPISID", "")
-        cookie_str = "; ".join(f"{k}={v}" for k, v in self.account.cookies.items())
-        headers = {
-            "Authorization": _sapisidhash(sapisid) if sapisid else "",
-            "X-Goog-Authuser": "0",
-            "Content-Type": "application/json",
-            "Origin": ORIGIN,
-            "Referer": f"{ORIGIN}/",
-            "Cookie": cookie_str,
-            "X-Goog-Ext-353267353-Jspb": "",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-        }
+        token = self._oauth_token or self._oauth.get_token()
+        if token:
+            self._oauth_token = token
+
+        if token:
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "X-Goog-Authuser": "0",
+            }
+        else:
+            sapisid = self.account.cookies.get("SAPISID", "")
+            if not sapisid:
+                sapisid = self.account.cookies.get("__Secure-3PAPISID", "")
+            cookie_str = "; ".join(
+                f"{k}={v}" for k, v in self.account.cookies.items()
+            )
+            headers = {
+                "Authorization": _sapisidhash(sapisid) if sapisid else "",
+                "X-Goog-Authuser": "0",
+                "Content-Type": "application/json",
+                "Origin": ORIGIN,
+                "Referer": f"{ORIGIN}/",
+                "Cookie": cookie_str,
+                "X-Goog-Ext-353267353-Jspb": "",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+            }
         return {k: v for k, v in headers.items() if v}
 
     # ------------------------------------------------------------------

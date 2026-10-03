@@ -71,7 +71,19 @@ async def main():
 
     client = GoogleAIClient(account, force_backend="grpc")
 
-    print("=== Testing MakerSuiteService (cookie auth) ===")
+    print("=== Testing MakerSuiteService (OAuth2 + gRPC) ===")
+    print()
+
+    print("[0] Acquiring OAuth2 token...")
+    try:
+        token = await client.ensure_oauth_token()
+        if token:
+            print(f"    OK: Token acquired ({len(token)} chars)")
+        else:
+            print("    WARNING: No OAuth2 token — falling back to cookie auth")
+            print("    Run 'python setup_oauth.py' for one-time setup")
+    except Exception as e:
+        print(f"    Token acquisition failed: {e}")
     print()
 
     print("[1] Checking user status...")

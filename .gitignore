@@ -6,6 +6,7 @@ dist/
 build/
 .eggs/
 accounts.json
+.oauth_token.json
 output/
 *.env
 .venv/
