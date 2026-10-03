@@ -1,17 +1,15 @@
-"""Core API client — reverse-engineered AI Studio MakerSuiteService gRPC-web API.
+"""Core API client — dual-backend for Google AI Studio.
 
-Uses the same internal RPC endpoints as AI Studio's browser frontend.
-Authentication: Google session cookies + SAPISIDHASH + X-Goog-Api-Key.
+Backend 1 (default): Public Gemini API at generativelanguage.googleapis.com
+  - Works everywhere, requires API key
+  - Set AISTUDIO_API_KEY or GEMINI_API_KEY env var
 
-Endpoints:
-  - GenerateImage (Imagen 4, Imagen 3, Narwhal)
-  - GenerateContent (Gemini image gen via responseModalities=IMAGE)
-  - GenerateVideo / GetGenerateVideoOperation (Veo 3, Veo 2)
+Backend 2 (fallback/local): MakerSuiteService gRPC-web at
+  alkalimakersuite-pa.clients6.google.com
+  - Cookie-based auth (SAPISIDHASH), same as browser
+  - Only works when the host is reachable (local machine, VPN)
 
-Setup:
-  1. Export cookies from aistudio.google.com (use a browser extension)
-  2. Set AISTUDIO_API_KEY env var (find it in AI Studio page source: search 'AIzaSy')
-     OR call client.auto_fetch_api_key() to get one via GenerateCloudApiKey
+The client auto-detects which backend to use based on what's configured.
 """
 
 from __future__ import annotations
@@ -45,7 +43,8 @@ from .models import (
 
 logger = logging.getLogger("gg_studio.client")
 
-# AI Studio's internal gRPC-web endpoint
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
 GRPC_BASE = (
     "https://alkalimakersuite-pa.clients6.google.com"
     "/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService"
@@ -59,9 +58,12 @@ _cached_api_key: str = ""
 
 
 def _get_api_key() -> str:
-    """Get AI Studio API key from env var AISTUDIO_API_KEY."""
     global _cached_api_key
-    key = os.environ.get("AISTUDIO_API_KEY", "") or _cached_api_key
+    key = (
+        os.environ.get("AISTUDIO_API_KEY", "")
+        or os.environ.get("GEMINI_API_KEY", "")
+        or _cached_api_key
+    )
     if key:
         _cached_api_key = key
     return key
@@ -75,22 +77,43 @@ class APIError(Exception):
 
 
 def _sapisidhash(sapisid: str, origin: str = ORIGIN) -> str:
-    """Build SAPISIDHASH Authorization header value."""
     ts = int(time.time())
     digest = hashlib.sha1(f"{ts} {sapisid} {origin}".encode()).hexdigest()
     return f"SAPISIDHASH {ts}_{digest}"
 
 
 class GoogleAIClient:
-    """AI Studio client using MakerSuiteService gRPC-web API with cookie auth."""
+    """Dual-backend AI Studio client.
 
-    def __init__(self, account: Account, timeout: float = 120.0):
+    Prefers the public Gemini API when an API key is available.
+    Falls back to MakerSuiteService gRPC-web when cookies are provided
+    and the internal endpoint is reachable.
+    """
+
+    def __init__(
+        self,
+        account: Account,
+        timeout: float = 120.0,
+        force_backend: str | None = None,
+    ):
         self.account = account
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self._session: Optional[aiohttp.ClientSession] = None
+        self._force_backend = force_backend  # "public" or "grpc"
 
-    def _build_headers(self) -> dict[str, str]:
-        """Build request headers with SAPISIDHASH auth."""
+    @property
+    def _use_public_api(self) -> bool:
+        if self._force_backend == "grpc":
+            return False
+        if self._force_backend == "public":
+            return True
+        return bool(_get_api_key())
+
+    # ------------------------------------------------------------------
+    # Headers
+    # ------------------------------------------------------------------
+
+    def _build_grpc_headers(self) -> dict[str, str]:
         sapisid = self.account.cookies.get("SAPISID", "")
         cookie_str = "; ".join(f"{k}={v}" for k, v in self.account.cookies.items())
         headers = {
@@ -109,6 +132,10 @@ class GoogleAIClient:
         }
         return {k: v for k, v in headers.items() if v}
 
+    # ------------------------------------------------------------------
+    # Session
+    # ------------------------------------------------------------------
+
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             connector = None
@@ -124,11 +151,36 @@ class GoogleAIClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
+    # ------------------------------------------------------------------
+    # Low-level request methods
+    # ------------------------------------------------------------------
+
     async def _rpc(self, method: str, body: dict) -> dict:
-        """Call a MakerSuiteService gRPC-web method."""
+        """Call MakerSuiteService gRPC-web method (cookie auth)."""
         url = f"{GRPC_BASE}/{method}"
         session = await self._get_session()
-        headers = self._build_headers()
+        headers = self._build_grpc_headers()
+
+        async with session.post(url, json=body, headers=headers) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise APIError(resp.status, text[:500], text)
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return {"raw": text}
+
+    async def _public_api(
+        self, model: str, method: str, body: dict
+    ) -> dict:
+        """Call public Gemini API (API key auth)."""
+        key = _get_api_key()
+        if not key:
+            raise APIError(401, "No API key set. Set GEMINI_API_KEY or AISTUDIO_API_KEY env var.")
+
+        url = f"{GEMINI_API_BASE}/{model}:{method}?key={key}"
+        session = await self._get_session()
+        headers = {"Content-Type": "application/json"}
 
         async with session.post(url, json=body, headers=headers) as resp:
             text = await resp.text()
@@ -144,22 +196,34 @@ class GoogleAIClient:
     # ------------------------------------------------------------------
 
     async def generate_access_token(self) -> Optional[str]:
-        """Get a fresh OAuth2 bearer token (ya29.xxx)."""
         resp = await self._rpc("GenerateAccessToken", {})
         return resp.get("accessToken")
 
     async def check_user_status(self) -> dict:
-        """Return user account status and feature flags."""
+        if self._use_public_api:
+            return await self._public_api("models", "list", {})
         return await self._rpc("CheckUserStatus", {})
 
     async def list_models(self) -> list[dict]:
-        """List all available models."""
+        if self._use_public_api:
+            key = _get_api_key()
+            session = await self._get_session()
+            url = f"{GEMINI_API_BASE}/models?key={key}"
+            async with session.get(url) as resp:
+                text = await resp.text()
+                if resp.status >= 400:
+                    raise APIError(resp.status, text[:500])
+                data = json.loads(text)
+                return data.get("models", [])
         resp = await self._rpc("ListModels", {})
         return resp.get("models", [])
 
     async def auto_fetch_api_key(self) -> str:
-        """Try to get or create an API key via the AI Studio API."""
         global _cached_api_key
+
+        existing = _get_api_key()
+        if existing:
+            return existing
 
         try:
             resp = await self._rpc("ListCloudApiKeys", {})
@@ -196,8 +260,7 @@ class GoogleAIClient:
         raise APIError(
             401,
             "Could not auto-fetch API key. "
-            "Set AISTUDIO_API_KEY env var manually "
-            "(find it in AI Studio page source: search AIzaSy).",
+            "Set AISTUDIO_API_KEY or GEMINI_API_KEY env var manually.",
         )
 
     # ------------------------------------------------------------------
@@ -212,18 +275,118 @@ class GoogleAIClient:
         num_images: int = 1,
         reference_images: list[str] | None = None,
     ) -> list[bytes]:
-        """Generate images using the specified model."""
         config = MODEL_CONFIG[model]
         dims = ASPECT_RATIO_MAP[aspect_ratio]
+
+        if self._use_public_api:
+            if config["endpoint"] == "generate_content":
+                return await self._public_generate_content_image(
+                    prompt, config, dims, num_images, reference_images
+                )
+            return await self._public_generate_image(
+                prompt, config, dims, num_images, reference_images
+            )
 
         if config["endpoint"] == "generate_content":
             return await self._generate_via_gemini(
                 prompt, config, dims, num_images, reference_images
             )
-
         return await self._generate_via_imagen(
             prompt, config, dims, num_images, reference_images
         )
+
+    # --- Public API image generation ---
+
+    async def _public_generate_image(
+        self,
+        prompt: str,
+        config: dict,
+        dims: dict,
+        num_images: int,
+        reference_images: list[str] | None,
+    ) -> list[bytes]:
+        """Generate images via public Gemini API (Imagen models)."""
+        model_id = config.get("public_model_id") or config["api_model_id"]
+        ratio_str = f"{dims['width']}:{dims['height']}"
+
+        body: dict[str, Any] = {
+            "instances": [{"prompt": prompt}],
+            "parameters": {
+                "sampleCount": num_images,
+                "aspectRatio": ratio_str,
+            },
+        }
+
+        if reference_images and config.get("supports_reference"):
+            for ref_path in reference_images:
+                img_bytes = Path(ref_path).read_bytes()
+                b64 = base64.b64encode(img_bytes).decode()
+                body["instances"][0]["referenceImages"] = [{
+                    "referenceImage": {"bytesBase64Encoded": b64},
+                    "referenceType": 1,
+                }]
+
+        data = await self._public_api(model_id, "predict", body)
+
+        results: list[bytes] = []
+        for pred in data.get("predictions", []):
+            b64_data = pred.get("bytesBase64Encoded", "")
+            if b64_data:
+                results.append(base64.b64decode(b64_data))
+
+        if not results:
+            raise APIError(500, "No images returned from public API", data)
+        return results
+
+    async def _public_generate_content_image(
+        self,
+        prompt: str,
+        config: dict,
+        dims: dict,
+        num_images: int,
+        reference_images: list[str] | None,
+    ) -> list[bytes]:
+        """Generate images via public Gemini API (generateContent + responseModalities)."""
+        model_id = config.get("public_model_id") or config["api_model_id"]
+        ratio_str = f"{dims['width']}:{dims['height']}"
+
+        parts: list[dict] = []
+
+        if reference_images and config.get("supports_reference"):
+            for ref_path in reference_images:
+                img_bytes = Path(ref_path).read_bytes()
+                b64 = base64.b64encode(img_bytes).decode()
+                parts.append({
+                    "inlineData": {
+                        "mimeType": "image/png",
+                        "data": b64,
+                    }
+                })
+
+        parts.append({"text": prompt})
+
+        body: dict[str, Any] = {
+            "contents": [{"role": "user", "parts": parts}],
+            "generationConfig": {
+                "responseModalities": ["IMAGE", "TEXT"],
+            },
+        }
+
+        data = await self._public_api(model_id, "generateContent", body)
+
+        results: list[bytes] = []
+        for candidate in data.get("candidates", []):
+            for part in candidate.get("content", {}).get("parts", []):
+                inline = part.get("inlineData", {})
+                b64_data = inline.get("data", "")
+                if b64_data:
+                    results.append(base64.b64decode(b64_data))
+
+        if not results:
+            raise APIError(500, "No images in GenerateContent response", data)
+        return results
+
+    # --- MakerSuiteService image generation ---
 
     async def _generate_via_imagen(
         self,
@@ -233,7 +396,6 @@ class GoogleAIClient:
         num_images: int,
         reference_images: list[str] | None,
     ) -> list[bytes]:
-        """Generate images via MakerSuiteService/GenerateImage (Imagen models)."""
         model_id = config["api_model_id"]
         ratio_str = f"{dims['width']}:{dims['height']}"
 
@@ -280,7 +442,6 @@ class GoogleAIClient:
         num_images: int,
         reference_images: list[str] | None,
     ) -> list[bytes]:
-        """Generate images via MakerSuiteService/GenerateContent (Gemini models)."""
         model_id = config["api_model_id"]
         ratio_str = f"{dims['width']}:{dims['height']}"
 
@@ -337,11 +498,16 @@ class GoogleAIClient:
         duration_seconds: int = 8,
         reference_image: str | None = None,
     ) -> bytes:
-        """Generate a video via MakerSuiteService/GenerateVideo."""
         config = MODEL_CONFIG[model]
         model_id = config["api_model_id"]
         dims = ASPECT_RATIO_MAP[aspect_ratio]
         ratio_str = f"{dims['width']}:{dims['height']}"
+
+        if self._use_public_api:
+            pub_model_id = config.get("public_model_id") or model_id
+            return await self._public_generate_video(
+                prompt, pub_model_id, ratio_str, duration_seconds, reference_image, config
+            )
 
         body: dict[str, Any] = {
             "model": model_id,
@@ -365,10 +531,87 @@ class GoogleAIClient:
             raise APIError(500, "No operation ID returned", data)
 
         logger.info("Video generation started: %s", operation_id)
-        return await self._poll_video(operation_id)
+        return await self._poll_video_grpc(operation_id)
 
-    async def _poll_video(self, operation_id: str) -> bytes:
-        """Poll GetGenerateVideoOperation until done."""
+    async def _public_generate_video(
+        self,
+        prompt: str,
+        model_id: str,
+        ratio_str: str,
+        duration_seconds: int,
+        reference_image: str | None,
+        config: dict,
+    ) -> bytes:
+        """Generate video via public Gemini API."""
+        body: dict[str, Any] = {
+            "instances": [{
+                "prompt": prompt,
+            }],
+            "parameters": {
+                "aspectRatio": ratio_str,
+                "durationSeconds": duration_seconds,
+            },
+        }
+
+        if reference_image and config.get("supports_reference"):
+            img_bytes = Path(reference_image).read_bytes()
+            b64 = base64.b64encode(img_bytes).decode()
+            body["instances"][0]["image"] = {"bytesBase64Encoded": b64}
+
+        data = await self._public_api(model_id, "predictLongRunning", body)
+
+        op_name = data.get("name", "")
+        if not op_name:
+            raise APIError(500, "No operation name returned", data)
+
+        logger.info("Video generation started: %s", op_name)
+        return await self._poll_video_public(op_name)
+
+    async def _poll_video_public(self, operation_name: str) -> bytes:
+        """Poll public API long-running operation."""
+        key = _get_api_key()
+        start = time.monotonic()
+        session = await self._get_session()
+
+        while time.monotonic() - start < POLL_TIMEOUT:
+            url = f"{GEMINI_API_BASE}/{operation_name}?key={key}"
+            async with session.get(url) as resp:
+                text = await resp.text()
+                if resp.status >= 400:
+                    raise APIError(resp.status, text[:500])
+                data = json.loads(text)
+
+            if data.get("done"):
+                response = data.get("response", {})
+                for pred in response.get("predictions", []):
+                    b64 = pred.get("bytesBase64Encoded", "")
+                    if b64:
+                        return base64.b64decode(b64)
+                for vid in response.get("videos", []):
+                    b64 = vid.get("bytesBase64Encoded", "")
+                    if b64:
+                        return base64.b64decode(b64)
+                    uri = vid.get("uri", "")
+                    if uri:
+                        return await self._download_uri(uri)
+
+                error = data.get("error", {})
+                if error:
+                    raise APIError(
+                        error.get("code", 500),
+                        error.get("message", "Video generation failed"),
+                    )
+                raise APIError(500, "Operation done but no video data", data)
+
+            progress = data.get("metadata", {}).get("progressPercent", "?")
+            elapsed = time.monotonic() - start
+            logger.info("Video polling %s — %s%% (%.0fs)", operation_name, progress, elapsed)
+            await asyncio.sleep(POLL_INTERVAL)
+
+        raise APIError(408, f"Video generation timed out after {POLL_TIMEOUT}s")
+
+    async def _poll_video_grpc(self, operation_id: str) -> bytes:
+        """Poll GetGenerateVideoOperation (gRPC-web backend)."""
         start = time.monotonic()
 
         while time.monotonic() - start < POLL_TIMEOUT:
@@ -415,10 +658,9 @@ class GoogleAIClient:
         raise APIError(408, f"Video generation timed out after {POLL_TIMEOUT}s")
 
     async def _download_uri(self, uri: str) -> bytes:
-        """Download video from a Google-internal URI."""
         session = await self._get_session()
-        headers = self._build_headers()
+        headers = self._build_grpc_headers() if not self._use_public_api else {}
         async with session.get(uri, headers=headers) as resp:
             if resp.status >= 400:
-                raise APIError(resp.status, f"Failed to download video from {uri}")
+                raise APIError(resp.status, f"Failed to download from {uri}")
             return await resp.read()
