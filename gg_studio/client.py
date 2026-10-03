@@ -1,11 +1,17 @@
-"""Core API client — direct HTTP calls to Google AI Studio endpoints."""
+"""Core API client — direct HTTP calls to Google AI Studio endpoints.
+
+Uses AI Studio's internal RPC endpoints with cookie-based authentication.
+No API key required — authenticates via Google account session cookies.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
+import re
 import time
 import uuid
 from pathlib import Path
@@ -30,11 +36,26 @@ from .models import (
 
 logger = logging.getLogger("gg_studio.client")
 
-BASE_URL = "https://generativelanguage.googleapis.com"
 AISTUDIO_URL = "https://aistudio.google.com"
+ALKALI_URL = "https://alkali-pa.clients6.google.com"
 
 POLL_INTERVAL = 5.0
 POLL_TIMEOUT = 600.0
+
+_cached_key: str = ""
+
+
+def _get_aistudio_key() -> str:
+    """Get AI Studio's public client key via AISTUDIO_API_KEY env var.
+
+    Find it in AI Studio's page source (search for 'AIzaSy' in the JS).
+    """
+    global _cached_key
+    import os
+    key = os.environ.get("AISTUDIO_API_KEY", "") or _cached_key
+    if key:
+        _cached_key = key
+    return key
 
 
 class APIError(Exception):
@@ -44,13 +65,29 @@ class APIError(Exception):
         super().__init__(f"HTTP {status}: {message}")
 
 
+def _sapisidhash(origin: str, sapisid: str) -> str:
+    """Generate SAPISIDHASH for Google API authentication."""
+    timestamp = str(int(time.time()))
+    raw = f"{timestamp} {sapisid} {origin}"
+    digest = hashlib.sha1(raw.encode()).hexdigest()
+    return f"SAPISIDHASH {timestamp}_{digest}"
+
+
 class GoogleAIClient:
-    """Stateless API client bound to a single account."""
+    """API client bound to a single account using cookie auth via AI Studio."""
 
     def __init__(self, account: Account, timeout: float = 120.0):
         self.account = account
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self._session: Optional[aiohttp.ClientSession] = None
+
+    def _get_headers(self) -> dict[str, str]:
+        headers = get_auth_headers(self.account)
+        sapisid = self.account.cookies.get("SAPISID", "")
+        if sapisid:
+            headers["Authorization"] = _sapisidhash(AISTUDIO_URL, sapisid)
+        headers["X-Goog-Authuser"] = "0"
+        return headers
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -60,7 +97,6 @@ class GoogleAIClient:
             self._session = aiohttp.ClientSession(
                 connector=connector,
                 timeout=self.timeout,
-                headers=get_auth_headers(self.account),
             )
         return self._session
 
@@ -74,11 +110,15 @@ class GoogleAIClient:
         url: str,
         *,
         json_data: dict | None = None,
+        data: str | bytes | None = None,
         params: dict | None = None,
+        headers: dict | None = None,
     ) -> dict:
         session = await self._get_session()
+        req_headers = headers or self._get_headers()
         async with session.request(
-            method, url, json=json_data, params=params
+            method, url, json=json_data, data=data, params=params,
+            headers=req_headers,
         ) as resp:
             body = await resp.text()
             if resp.status >= 400:
@@ -86,8 +126,9 @@ class GoogleAIClient:
             try:
                 return json.loads(body)
             except json.JSONDecodeError:
-                if body.startswith(")]}'\n"):
-                    return json.loads(body[4:].strip())
+                if body.startswith(")]}'"): 
+                    cleaned = body.split("\n", 1)[-1].strip()
+                    return json.loads(cleaned)
                 return {"raw": body}
 
     # ------------------------------------------------------------------
@@ -123,7 +164,7 @@ class GoogleAIClient:
         reference_images: list[str] | None,
     ) -> list[bytes]:
         model_id = config["api_model_id"]
-        url = f"{BASE_URL}/v1beta/{model_id}:predict"
+        url = f"{ALKALI_URL}/v1beta/{model_id}:predict"
 
         instances = [{"prompt": prompt}]
 
@@ -131,10 +172,7 @@ class GoogleAIClient:
             for ref_path in reference_images:
                 img_bytes = Path(ref_path).read_bytes()
                 b64 = base64.b64encode(img_bytes).decode()
-                instances[0]["referenceImages"] = instances[0].get(
-                    "referenceImages", []
-                )
-                instances[0]["referenceImages"].append(
+                instances[0].setdefault("referenceImages", []).append(
                     {
                         "referenceImage": {"bytesBase64Encoded": b64},
                         "referenceType": "STYLE",
@@ -150,7 +188,13 @@ class GoogleAIClient:
             },
         }
 
-        data = await self._request("POST", url, json_data=payload)
+        headers = self._get_headers()
+        sapisid = self.account.cookies.get("SAPISID", "")
+        if sapisid:
+            headers["Authorization"] = _sapisidhash(ALKALI_URL, sapisid)
+        headers["X-Goog-Api-Key"] = _get_aistudio_key()
+
+        data = await self._request("POST", url, json_data=payload, headers=headers)
         results: list[bytes] = []
         for pred in data.get("predictions", []):
             b64_data = pred.get("bytesBase64Encoded", "")
@@ -167,7 +211,7 @@ class GoogleAIClient:
         reference_images: list[str] | None,
     ) -> list[bytes]:
         model_id = config["api_model_id"]
-        url = f"{BASE_URL}/v1beta/{model_id}:generateContent"
+        url = f"{ALKALI_URL}/v1beta/{model_id}:generateContent"
 
         parts: list[dict] = []
 
@@ -197,7 +241,13 @@ class GoogleAIClient:
             },
         }
 
-        data = await self._request("POST", url, json_data=payload)
+        headers = self._get_headers()
+        sapisid = self.account.cookies.get("SAPISID", "")
+        if sapisid:
+            headers["Authorization"] = _sapisidhash(ALKALI_URL, sapisid)
+        headers["X-Goog-Api-Key"] = _get_aistudio_key()
+
+        data = await self._request("POST", url, json_data=payload, headers=headers)
         results: list[bytes] = []
         for candidate in data.get("candidates", []):
             for part in candidate.get("content", {}).get("parts", []):
@@ -221,7 +271,7 @@ class GoogleAIClient:
     ) -> bytes:
         config = MODEL_CONFIG[model]
         model_id = config["api_model_id"]
-        url = f"{BASE_URL}/v1beta/{model_id}:predictLongRunning"
+        url = f"{ALKALI_URL}/v1beta/{model_id}:predictLongRunning"
 
         dims = ASPECT_RATIO_MAP[aspect_ratio]
 
@@ -245,7 +295,13 @@ class GoogleAIClient:
                 }
             ]
 
-        data = await self._request("POST", url, json_data=payload)
+        headers = self._get_headers()
+        sapisid = self.account.cookies.get("SAPISID", "")
+        if sapisid:
+            headers["Authorization"] = _sapisidhash(ALKALI_URL, sapisid)
+        headers["X-Goog-Api-Key"] = _get_aistudio_key()
+
+        data = await self._request("POST", url, json_data=payload, headers=headers)
         operation_name = data.get("name")
         if not operation_name:
             raise APIError(500, "No operation name returned", data)
@@ -253,11 +309,17 @@ class GoogleAIClient:
         return await self._poll_operation(operation_name)
 
     async def _poll_operation(self, operation_name: str) -> bytes:
-        url = f"{BASE_URL}/v1beta/{operation_name}"
+        url = f"{ALKALI_URL}/v1beta/{operation_name}"
         start = time.monotonic()
 
+        headers = self._get_headers()
+        sapisid = self.account.cookies.get("SAPISID", "")
+        if sapisid:
+            headers["Authorization"] = _sapisidhash(ALKALI_URL, sapisid)
+        headers["X-Goog-Api-Key"] = _get_aistudio_key()
+
         while time.monotonic() - start < POLL_TIMEOUT:
-            data = await self._request("GET", url)
+            data = await self._request("GET", url, headers=headers)
 
             if data.get("done"):
                 response = data.get("response", {})
@@ -284,95 +346,82 @@ class GoogleAIClient:
                 err = data["error"]
                 raise APIError(err.get("code", 500), err.get("message", ""))
 
+            logger.info("Polling %s... (%.0fs)", operation_name, time.monotonic() - start)
             await asyncio.sleep(POLL_INTERVAL)
 
         raise APIError(408, f"Operation timed out after {POLL_TIMEOUT}s")
 
     # ------------------------------------------------------------------
-    # AI Studio internal endpoints (alternative auth path)
+    # AI Studio batchexecute (alternative path)
     # ------------------------------------------------------------------
 
-    async def generate_image_aistudio(
+    async def generate_image_batchexecute(
         self,
         prompt: str,
         model: ModelType = ModelType.IMAGEN_4,
         aspect_ratio: AspectRatio = AspectRatio.LANDSCAPE_16_9,
-        num_images: int = 1,
+        num_images: int = 4,
     ) -> list[bytes]:
-        """Use AI Studio's internal RPC endpoint (cookie auth, no API key)."""
+        """Use AI Studio's batchexecute RPC (the exact same call the browser makes)."""
         config = MODEL_CONFIG[model]
         model_id = config["api_model_id"]
-
-        url = (
-            f"{AISTUDIO_URL}/_/api/v1/generate_image"
-            f"?model={model_id}"
-        )
-
         dims = ASPECT_RATIO_MAP[aspect_ratio]
+        ratio_str = f"{dims['width']}:{dims['height']}"
 
-        payload = {
-            "prompt": prompt,
-            "sampleCount": num_images,
-            "aspectRatio": f"{dims['width']}:{dims['height']}",
-        }
+        inner_request = json.dumps([
+            [prompt, None, None, None, None, None, None, None],
+            [model_id.replace("models/", ""), num_images, ratio_str],
+            None, None, None, None, None, None, None, None, None, None,
+        ])
+
+        rpc_id = "bwAWof"
+        f_req = json.dumps([[[rpc_id, inner_request, None, "generic"]]])
+
+        url = f"{AISTUDIO_URL}/_/MakerSuiteUi/data/batchexecute"
+
+        headers = self._get_headers()
+        headers["Content-Type"] = "application/x-www-form-urlencoded;charset=utf-8"
+
+        form_data = f"f.req={aiohttp.helpers.quote(f_req, safe='')}"
 
         session = await self._get_session()
-        headers = get_auth_headers(self.account)
-        headers["X-Requested-With"] = "XMLHttpRequest"
-
-        async with session.post(url, json=payload, headers=headers) as resp:
+        async with session.post(url, data=form_data, headers=headers) as resp:
             body = await resp.text()
             if resp.status >= 400:
                 raise APIError(resp.status, body[:500], body)
 
-            if body.startswith(")]}'\n"):
-                body = body[4:].strip()
+        results: list[bytes] = []
+        for line in body.split("\n"):
+            line = line.strip()
+            if not line or not line.startswith("["):
+                continue
+            try:
+                outer = json.loads(line)
+                for item in outer:
+                    if isinstance(item, list) and len(item) >= 3:
+                        inner_data = item[2]
+                        if isinstance(inner_data, str):
+                            parsed = json.loads(inner_data)
+                            images = self._extract_images_from_batch(parsed)
+                            results.extend(images)
+            except (json.JSONDecodeError, IndexError, TypeError):
+                continue
 
-            data = json.loads(body)
-            results: list[bytes] = []
-            for item in data if isinstance(data, list) else [data]:
-                for img in item.get("images", item.get("predictions", [])):
-                    b64 = img.get("bytesBase64Encoded", img.get("data", ""))
-                    if b64:
-                        results.append(base64.b64decode(b64))
-            return results
+        if not results:
+            raise APIError(500, "No images in batchexecute response")
+        return results
 
-    async def generate_video_aistudio(
-        self,
-        prompt: str,
-        model: ModelType = ModelType.VEO_3,
-        aspect_ratio: AspectRatio = AspectRatio.LANDSCAPE_16_9,
-        duration_seconds: int = 8,
-    ) -> tuple[str, None]:
-        """Start video gen via AI Studio internal RPC. Returns operation name."""
-        config = MODEL_CONFIG[model]
-        model_id = config["api_model_id"]
-
-        url = (
-            f"{AISTUDIO_URL}/_/api/v1/generate_video"
-            f"?model={model_id}"
-        )
-
-        dims = ASPECT_RATIO_MAP[aspect_ratio]
-
-        payload = {
-            "prompt": prompt,
-            "aspectRatio": f"{dims['width']}:{dims['height']}",
-            "durationSeconds": duration_seconds,
-        }
-
-        session = await self._get_session()
-        headers = get_auth_headers(self.account)
-        headers["X-Requested-With"] = "XMLHttpRequest"
-
-        async with session.post(url, json=payload, headers=headers) as resp:
-            body = await resp.text()
-            if resp.status >= 400:
-                raise APIError(resp.status, body[:500], body)
-
-            if body.startswith(")]}'\n"):
-                body = body[4:].strip()
-
-            data = json.loads(body)
-            op_name = data.get("name", "")
-            return op_name, None
+    def _extract_images_from_batch(self, data: Any) -> list[bytes]:
+        results: list[bytes] = []
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, str) and len(item) > 200:
+                    try:
+                        decoded = base64.b64decode(item)
+                        if decoded[:4] in (b"\x89PNG", b"\xff\xd8\xff\xe0", b"\xff\xd8\xff\xe1"):
+                            results.append(decoded)
+                    except Exception:
+                        pass
+                elif isinstance(item, list):
+                    results.extend(self._extract_images_from_batch(item))
+        return results
