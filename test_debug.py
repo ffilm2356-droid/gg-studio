@@ -125,14 +125,40 @@ def try_extract_token_from_page(cookies):
 
 
 def try_oauth2_code_flow(cookies):
-    """Strategy 2: Silent OAuth2 code flow via accounts.google.com."""
-    print("\n--- Test 3: OAuth2 silent auth code flow ---")
+    """Strategy 2: Silent OAuth2 code flow via localhost redirect."""
+    import socket
+    import threading
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    print("\n--- Test 3: OAuth2 silent auth code flow (localhost redirect) ---")
     cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
 
     client_id = (
         "764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur"
         ".apps.googleusercontent.com"
     )
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    redirect_uri = f"http://127.0.0.1:{port}"
+
+    captured_code = [None]
+
+    class CallbackHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            if "code" in qs:
+                captured_code[0] = qs["code"][0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"OK")
+        def log_message(self, format, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", port), CallbackHandler)
+
     params = urllib.parse.urlencode({
         "client_id": client_id,
         "scope": (
@@ -140,7 +166,7 @@ def try_oauth2_code_flow(cookies):
             "https://www.googleapis.com/auth/generative-language"
         ),
         "response_type": "code",
-        "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
+        "redirect_uri": redirect_uri,
         "prompt": "none",
         "access_type": "offline",
     })
@@ -169,56 +195,58 @@ def try_oauth2_code_flow(cookies):
         html = resp.read().decode("utf-8", errors="replace")
         print(f"Response: {len(html)} bytes")
 
-        # Look for auth code
-        code_match = (
-            re.search(r">(\s*4/[a-zA-Z0-9_-]+)\s*<", html)
-            or re.search(r'value="(4/[a-zA-Z0-9_-]+)"', html)
-            or re.search(r"(4/[a-zA-Z0-9_-]{20,})", html)
-        )
-        if code_match:
-            code = code_match.group(1).strip()
-            print(f"FOUND auth code: {code[:10]}...")
-            return exchange_code_for_token(code, client_id)
-
-        if "error" in html.lower():
-            err_match = re.search(r'"error"\s*:\s*"([^"]+)"', html)
-            if err_match:
-                print(f"OAuth error: {err_match.group(1)}")
-            elif "consent" in html.lower():
-                print("Consent required — run interactive setup first")
-        else:
-            print(f"Page snippet: {html[:200]}")
-
     except urllib.error.HTTPError as e:
         if e.code in (301, 302, 303, 307, 308):
             location = e.headers.get("Location", "")
-            print(f"  Final redirect: {location[:120]}")
-            parsed = urllib.parse.urlparse(location)
-            qs = urllib.parse.parse_qs(parsed.query)
-            if "code" in qs:
-                print(f"FOUND auth code in redirect!")
-                return exchange_code_for_token(qs["code"][0], client_id)
-            frag = urllib.parse.parse_qs(parsed.fragment)
-            if "access_token" in frag:
-                token = frag["access_token"][0]
-                print(f"FOUND token in redirect ({len(token)} chars)")
-                return token
+            tracker.redirects.append((e.code, location))
+            print(f"  Redirect {e.code} -> {location[:100]}...")
         else:
             print(f"HTTP {e.code}: {e.reason}")
-            print(f"Body: {e.read().decode()[:300]}")
+            try:
+                print(f"Body: {e.read().decode()[:300]}")
+            except Exception:
+                pass
+            server.server_close()
+            return None
 
     for code, rurl in tracker.redirects:
         parsed = urllib.parse.urlparse(rurl)
         qs = urllib.parse.parse_qs(parsed.query)
         if "code" in qs:
-            print(f"FOUND auth code in redirect chain!")
-            return exchange_code_for_token(qs["code"][0], client_id)
+            print(f"FOUND auth code in redirect!")
+            server.server_close()
+            return exchange_code_for_token(qs["code"][0], client_id, redirect_uri)
+        if "error" in qs:
+            print(f"OAuth error: {qs['error'][0]}")
+            desc = qs.get("error_description", [""])[0]
+            if desc:
+                print(f"  Description: {urllib.parse.unquote(desc)}")
+            server.server_close()
+            return None
+        if rurl.startswith(redirect_uri):
+            print(f"Redirect to localhost — starting callback server...")
+            server_thread = threading.Thread(
+                target=server.handle_request, daemon=True
+            )
+            server_thread.start()
+            try:
+                follow_req = urllib.request.Request(rurl)
+                urllib.request.urlopen(follow_req, timeout=10)
+            except Exception:
+                pass
+            server_thread.join(timeout=5)
+            if captured_code[0]:
+                print(f"FOUND auth code via callback!")
+                server.server_close()
+                return exchange_code_for_token(captured_code[0], client_id, redirect_uri)
 
     print("No auth code obtained")
+    print("  -> Run 'python setup_oauth.py' for interactive setup")
+    server.server_close()
     return None
 
 
-def exchange_code_for_token(code, client_id):
+def exchange_code_for_token(code, client_id, redirect_uri="http://127.0.0.1"):
     """Exchange authorization code for access token."""
     print(f"  Exchanging code for token...")
     client_secret = "d-FL95Q19q7MQmFpd7hHD0Ty"
@@ -227,7 +255,7 @@ def exchange_code_for_token(code, client_id):
         "client_secret": client_secret,
         "code": code,
         "grant_type": "authorization_code",
-        "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
+        "redirect_uri": redirect_uri,
     }).encode()
 
     req = urllib.request.Request(

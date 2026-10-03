@@ -5,9 +5,9 @@ cookies + SAPISIDHASH alone are rejected. This module converts
 the user's browser cookies into a usable access token.
 
 Strategies (tried in order):
-  1. Extract embedded token from AI Studio page HTML
-  2. OAuth2 authorization code flow via accounts.google.com
-  3. Token refresh using a cached refresh_token
+  1. Token refresh using a cached refresh_token (.oauth_token.json)
+  2. Extract embedded token from AI Studio page HTML
+  3. OAuth2 authorization code flow via localhost redirect
 """
 
 from __future__ import annotations
@@ -15,10 +15,13 @@ from __future__ import annotations
 import json
 import logging
 import re
+import socket
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Optional
 
@@ -44,6 +47,12 @@ _UA = (
 _TOKEN_CACHE = Path(".oauth_token.json")
 
 
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def __init__(self):
         self.redirects: list[str] = []
@@ -51,6 +60,22 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         self.redirects.append(newurl)
         return None
+
+
+class _SilentCallbackHandler(BaseHTTPRequestHandler):
+    auth_code: str | None = None
+
+    def do_GET(self):
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        if "code" in qs:
+            _SilentCallbackHandler.auth_code = qs["code"][0]
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(b"<html><body>OK</body></html>")
+
+    def log_message(self, format, *args):
+        pass
 
 
 class OAuthTokenManager:
@@ -110,19 +135,28 @@ class OAuthTokenManager:
         return None
 
     def _oauth2_code_flow(self) -> Optional[str]:
-        """Silent OAuth2 authorization code flow using session cookies."""
+        """Silent OAuth2 authorization code flow using session cookies.
+
+        Uses a localhost redirect URI. Starts a temporary local HTTP server
+        to capture the authorization code from Google's redirect.
+        """
+        port = _find_free_port()
+        redirect_uri = f"http://127.0.0.1:{port}"
+
+        _SilentCallbackHandler.auth_code = None
+        server = HTTPServer(("127.0.0.1", port), _SilentCallbackHandler)
+
         params = urllib.parse.urlencode({
             "client_id": _GCLOUD_CLIENT_ID,
             "scope": _SCOPES,
             "response_type": "code",
-            "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
+            "redirect_uri": redirect_uri,
             "prompt": "none",
             "access_type": "offline",
         })
         url = f"https://accounts.google.com/o/oauth2/auth?{params}"
 
         handler = _NoRedirect()
-        handler.redirects = []
         opener = urllib.request.build_opener(handler)
 
         req = urllib.request.Request(url)
@@ -135,54 +169,49 @@ class OAuthTokenManager:
         except urllib.error.HTTPError as e:
             if e.code in (301, 302, 303, 307, 308):
                 location = e.headers.get("Location", "")
-                parsed = urllib.parse.urlparse(location)
-                qs = urllib.parse.parse_qs(parsed.query)
-                if "code" in qs:
-                    return self._exchange_code(qs["code"][0])
-                frag = urllib.parse.parse_qs(parsed.fragment)
-                if "access_token" in frag:
-                    token = frag["access_token"][0]
-                    self._set_token(token, expires_in=3600)
-                    return token
-                req2 = urllib.request.Request(location)
-                req2.add_header("Cookie", self._cookie_str)
-                req2.add_header("User-Agent", _UA)
-                resp = urllib.request.urlopen(req2, timeout=30)
-                html = resp.read().decode("utf-8", errors="replace")
+                handler.redirects.append(location)
+                html = ""
             else:
+                server.server_close()
                 raise
 
         for redirect_url in handler.redirects:
             parsed = urllib.parse.urlparse(redirect_url)
             qs = urllib.parse.parse_qs(parsed.query)
             if "code" in qs:
-                return self._exchange_code(qs["code"][0])
-            frag = urllib.parse.parse_qs(parsed.fragment)
-            if "access_token" in frag:
-                token = frag["access_token"][0]
-                self._set_token(token, expires_in=3600)
-                return token
+                server.server_close()
+                return self._exchange_code(qs["code"][0], redirect_uri)
+            if "error" in qs:
+                logger.debug("OAuth2 error: %s", qs["error"][0])
+                server.server_close()
+                return None
+            if redirect_url.startswith(redirect_uri):
+                server_thread = threading.Thread(
+                    target=server.handle_request, daemon=True
+                )
+                server_thread.start()
+                try:
+                    follow_req = urllib.request.Request(redirect_url)
+                    urllib.request.urlopen(follow_req, timeout=10)
+                except Exception:
+                    pass
+                server_thread.join(timeout=5)
+                if _SilentCallbackHandler.auth_code:
+                    server.server_close()
+                    return self._exchange_code(
+                        _SilentCallbackHandler.auth_code, redirect_uri
+                    )
 
-        code_match = (
-            re.search(r">(\s*4/[a-zA-Z0-9_-]+)\s*<", html)
-            or re.search(r'value="(4/[a-zA-Z0-9_-]+)"', html)
-            or re.search(r"(4/[a-zA-Z0-9_-]{20,})", html)
-        )
-        if code_match:
-            return self._exchange_code(code_match.group(1).strip())
-
-        if "approval_code" in html or "success" in html.lower():
-            logger.debug("Auth page loaded but no code found")
-
+        server.server_close()
         return None
 
-    def _exchange_code(self, code: str) -> str:
+    def _exchange_code(self, code: str, redirect_uri: str = "http://127.0.0.1") -> str:
         data = urllib.parse.urlencode({
             "client_id": _GCLOUD_CLIENT_ID,
             "client_secret": _GCLOUD_CLIENT_SECRET,
             "code": code,
             "grant_type": "authorization_code",
-            "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
+            "redirect_uri": redirect_uri,
         }).encode()
 
         req = urllib.request.Request(
@@ -246,29 +275,3 @@ class OAuthTokenManager:
                 self._refresh_token = data.get("refresh_token")
         except (OSError, json.JSONDecodeError):
             pass
-
-
-def get_oauth2_token_interactive(cookies: dict[str, str]) -> str:
-    """Interactive OAuth2 flow — opens a URL for user to authorize.
-
-    Use this when the silent flow fails (first-time setup).
-    Returns the access token.
-    """
-    params = urllib.parse.urlencode({
-        "client_id": _GCLOUD_CLIENT_ID,
-        "scope": _SCOPES,
-        "response_type": "code",
-        "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
-        "access_type": "offline",
-    })
-    url = f"https://accounts.google.com/o/oauth2/auth?{params}"
-
-    print("\n=== One-time OAuth2 Setup ===")
-    print("Open this URL in your browser (where you're signed into Google):")
-    print()
-    print(f"  {url}")
-    print()
-    code = input("Paste the authorization code here: ").strip()
-
-    mgr = OAuthTokenManager(cookies)
-    return mgr._exchange_code(code)
