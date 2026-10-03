@@ -180,9 +180,12 @@ async def main():
             print("TIP: Run 'python setup_oauth.py' for OAuth2 setup")
         if not os.environ.get("AISTUDIO_API_KEY"):
             print("TIP: Set AISTUDIO_API_KEY from aistudio.google.com/apikey")
-        if client._gcp_project is None and client._oauth_token:
+        if client._gcp_project:
+            print(f"TIP: Enable Vertex AI API for generation fallback:")
+            print(f"     https://console.developers.google.com/apis/api/aiplatform.googleapis.com/overview?project={client._gcp_project}")
+            print("     After enabling, wait 1-2 minutes then re-run this test.")
+        elif client._oauth_token:
             print("TIP: Create a GCP project at console.cloud.google.com")
-            print("     and enable the Vertex AI API for image/video generation")
     print("=" * 50)
 
     await client.close()

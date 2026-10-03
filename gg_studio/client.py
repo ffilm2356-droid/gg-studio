@@ -281,7 +281,7 @@ class GoogleAIClient:
                         return json.loads(text)
                     except json.JSONDecodeError:
                         return {"raw": text}
-                if token and resp.status in (429, 403):
+                if token and resp.status in (429, 403, 404):
                     logger.info(
                         "API key failed (HTTP %d), trying Vertex AI...",
                         resp.status,
@@ -406,10 +406,10 @@ class GoogleAIClient:
         if self._use_public_api:
             if config["endpoint"] == "generate_content":
                 return await self._public_generate_content_image(
-                    prompt, config, dims, num_images, reference_images
+                    prompt, config, aspect_ratio, num_images, reference_images
                 )
             return await self._public_generate_image(
-                prompt, config, dims, num_images, reference_images
+                prompt, config, aspect_ratio, num_images, reference_images
             )
 
         if config["endpoint"] == "generate_content":
@@ -426,13 +426,13 @@ class GoogleAIClient:
         self,
         prompt: str,
         config: dict,
-        dims: dict,
+        aspect_ratio: AspectRatio,
         num_images: int,
         reference_images: list[str] | None,
     ) -> list[bytes]:
         """Generate images via public Gemini API (Imagen models)."""
         model_id = config.get("public_model_id") or config["api_model_id"]
-        ratio_str = f"{dims['width']}:{dims['height']}"
+        ratio_str = aspect_ratio.value
 
         body: dict[str, Any] = {
             "instances": [{"prompt": prompt}],
@@ -467,13 +467,13 @@ class GoogleAIClient:
         self,
         prompt: str,
         config: dict,
-        dims: dict,
+        aspect_ratio: AspectRatio,
         num_images: int,
         reference_images: list[str] | None,
     ) -> list[bytes]:
         """Generate images via public Gemini API (generateContent + responseModalities)."""
         model_id = config.get("public_model_id") or config["api_model_id"]
-        ratio_str = f"{dims['width']}:{dims['height']}"
+        ratio_str = aspect_ratio.value
 
         parts: list[dict] = []
 
@@ -631,7 +631,7 @@ class GoogleAIClient:
         if self._use_public_api:
             pub_model_id = config.get("public_model_id") or model_id
             return await self._public_generate_video(
-                prompt, pub_model_id, ratio_str, duration_seconds, reference_image, config
+                prompt, pub_model_id, aspect_ratio.value, duration_seconds, reference_image, config
             )
 
         body: dict[str, Any] = {
