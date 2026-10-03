@@ -5,8 +5,7 @@ Usage:
     pip install aiohttp aiohttp-socks
     python test_local.py
 
-This uses the MakerSuiteService gRPC-web backend (cookie auth).
-Cookies are loaded from accounts.json in the same directory.
+This tests image and video generation through the public API + Vertex AI.
 """
 
 import asyncio
@@ -31,11 +30,6 @@ async def main():
     with open(accounts_path) as f:
         data = json.load(f)
 
-    # Support multiple formats:
-    #   1. [{"name": ..., "cookies": {...}}]           (list of accounts)
-    #   2. {"accounts": [{"name": ..., "cookies": ...}]}
-    #   3. {"url": ..., "cookies": [...]}              (raw cookie export)
-    #   4. {"name": ..., "cookies": {...}}             (single account)
     if isinstance(data, list):
         acct_data = data[0]
     elif "accounts" in data:
@@ -50,7 +44,6 @@ async def main():
     else:
         acct_data = data
 
-    # If cookies is a list of {name, value} objects, convert to dict
     raw_cookies = acct_data.get("cookies", {})
     if isinstance(raw_cookies, list) and raw_cookies and isinstance(raw_cookies[0], dict):
         acct_data["cookies"] = {c["name"]: c["value"] for c in raw_cookies}
@@ -70,39 +63,54 @@ async def main():
                 break
 
     client = GoogleAIClient(account)
+    passed = 0
+    failed = 0
 
-    print("=== Testing Google AI Studio API ===")
+    print("=== GG Studio API Test ===")
     print()
 
+    # --- Step 0: OAuth2 token ---
     print("[0] Acquiring OAuth2 token...")
     try:
         token = await client.ensure_oauth_token()
         if token:
             print(f"    OK: Token acquired ({len(token)} chars)")
         else:
-            print("    WARNING: No OAuth2 token — falling back to cookie auth")
+            print("    WARNING: No OAuth2 token — will use API key only")
             print("    Run 'python setup_oauth.py' for one-time setup")
     except Exception as e:
         print(f"    Token acquisition failed: {e}")
     print()
 
-    print("[1] Checking user status...")
+    # --- Step 1: GCP project detection (for Vertex AI) ---
+    print("[1] Detecting GCP project for Vertex AI...")
+    if client._oauth_token:
+        try:
+            project = await client._detect_gcp_project()
+            print(f"    OK: Project = {project}")
+            passed += 1
+        except Exception as e:
+            print(f"    FAILED: {e}")
+            print("    Vertex AI fallback won't work — will rely on API key only")
+            failed += 1
+    else:
+        print("    SKIPPED: No OAuth2 token")
+    print()
+
+    # --- Step 2: API connectivity ---
+    print("[2] Checking API connectivity...")
     try:
         status = await client.check_user_status()
         print(f"    OK: {json.dumps(status, indent=2)[:300]}")
-        print()
+        passed += 1
     except Exception as e:
         print(f"    FAILED: {e}")
-        print()
-        if "403" in str(e) or "connect" in str(e).lower():
-            print("    The MakerSuiteService endpoint is not reachable.")
-            print("    Make sure you're running this on your local machine,")
-            print("    not in a restricted cloud environment.")
-            print()
-            await client.close()
-            return
+        print("    (Continuing anyway — generation might still work)")
+        failed += 1
+    print()
 
-    print("[2] Generating image with Imagen 4...")
+    # --- Step 3: Image generation (Imagen 4) ---
+    print("[3] Generating image with Imagen 4...")
     try:
         images = await client.generate_image(
             prompt="A beautiful sunset over the ocean with golden clouds",
@@ -116,12 +124,14 @@ async def main():
             path = out_dir / f"test_imagen4_{i}.png"
             path.write_bytes(img_data)
             print(f"    Saved: {path} ({len(img_data)} bytes)")
-        print()
+        passed += 1
     except Exception as e:
         print(f"    FAILED: {e}")
-        print()
+        failed += 1
+    print()
 
-    print("[3] Generating image with Gemini Flash...")
+    # --- Step 4: Image generation (Gemini) ---
+    print("[4] Generating image with Gemini 3 Pro...")
     try:
         images = await client.generate_image(
             prompt="A cute robot painting a picture in a sunny garden",
@@ -132,15 +142,17 @@ async def main():
         out_dir = Path("output")
         out_dir.mkdir(exist_ok=True)
         for i, img_data in enumerate(images):
-            path = out_dir / f"test_gemini_flash_{i}.png"
+            path = out_dir / f"test_gemini_pro_{i}.png"
             path.write_bytes(img_data)
             print(f"    Saved: {path} ({len(img_data)} bytes)")
-        print()
+        passed += 1
     except Exception as e:
         print(f"    FAILED: {e}")
-        print()
+        failed += 1
+    print()
 
-    print("[4] Generating video with Veo 3 (takes 2-5 min)...")
+    # --- Step 5: Video generation (Veo 3) ---
+    print("[5] Generating video with Veo 3 (takes 2-5 min)...")
     try:
         video_data = await client.generate_video(
             prompt="A drone shot flying over a tropical beach at sunset, cinematic",
@@ -153,12 +165,26 @@ async def main():
         path = out_dir / "test_veo3.mp4"
         path.write_bytes(video_data)
         print(f"    Saved: {path} ({len(video_data)} bytes)")
-        print()
+        passed += 1
     except Exception as e:
         print(f"    FAILED: {e}")
-        print()
+        failed += 1
+    print()
 
-    print("=== Done ===")
+    # --- Summary ---
+    print("=" * 50)
+    print(f"=== RESULTS: {passed} passed, {failed} failed ===")
+    if failed > 0:
+        print()
+        if not client._oauth_token:
+            print("TIP: Run 'python setup_oauth.py' for OAuth2 setup")
+        if not os.environ.get("AISTUDIO_API_KEY"):
+            print("TIP: Set AISTUDIO_API_KEY from aistudio.google.com/apikey")
+        if client._gcp_project is None and client._oauth_token:
+            print("TIP: Create a GCP project at console.cloud.google.com")
+            print("     and enable the Vertex AI API for image/video generation")
+    print("=" * 50)
+
     await client.close()
 
 

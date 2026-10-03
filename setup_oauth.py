@@ -9,6 +9,7 @@ The refresh token is saved to .oauth_token.json for automatic renewal.
 """
 
 import json
+import os
 import socket
 import sys
 import threading
@@ -144,23 +145,58 @@ def main():
     else:
         print("WARNING: No refresh token — you may need to re-run this later")
 
-    print("\nValidating token with Generative Language API...")
-    api_url = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=3"
-    try:
-        req = urllib.request.Request(api_url)
-        req.add_header("Authorization", f"Bearer {access_token}")
+    print("\nValidating token...")
 
+    # Test 1: GCP project detection (cloud-platform scope)
+    rm_url = "https://cloudresourcemanager.googleapis.com/v1/projects?pageSize=5"
+    try:
+        req = urllib.request.Request(rm_url)
+        req.add_header("Authorization", f"Bearer {access_token}")
         resp = urllib.request.urlopen(req, timeout=15)
         body = resp.read().decode()
         data = json.loads(body)
-        models = [m.get("displayName", m.get("name", "")) for m in data.get("models", [])]
-        print(f"API OK! Found models: {', '.join(models[:3])}...")
-        print(f"\n=== Setup complete! Token is working. ===")
-        print("Run 'python test_local.py' to test image/video generation.")
+        projects = data.get("projects", [])
+        if projects:
+            names = [p.get("projectId", "") for p in projects[:3]]
+            print(f"GCP projects found: {', '.join(names)}")
+            gcp_project = None
+            for p in projects:
+                if "generative" in p.get("projectId", "").lower():
+                    gcp_project = p["projectId"]
+                    break
+            if not gcp_project:
+                gcp_project = projects[0].get("projectId", "")
+            print(f"Will use project: {gcp_project} (for Vertex AI)")
+        else:
+            print("WARNING: No GCP projects found.")
+            print("Create one at console.cloud.google.com for Vertex AI support.")
     except Exception as e:
-        print(f"Validation failed: {e}")
-        print("The token was obtained but may not have the right permissions.")
-        print("Try running test_debug.py to see more details.")
+        print(f"GCP project check failed: {e}")
+
+    # Test 2: API key listing (if available)
+    api_key = os.environ.get("AISTUDIO_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        env_path = Path(".env")
+        if env_path.exists():
+            for line in env_path.read_text().splitlines():
+                if line.startswith("AISTUDIO_API_KEY="):
+                    api_key = line.split("=", 1)[1].strip()
+                    break
+    if api_key:
+        try:
+            list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}&pageSize=3"
+            req = urllib.request.Request(list_url)
+            resp = urllib.request.urlopen(req, timeout=15)
+            body = resp.read().decode()
+            data = json.loads(body)
+            models = [m.get("displayName", m.get("name", "")) for m in data.get("models", [])]
+            print(f"API key OK! Models: {', '.join(models[:3])}...")
+        except Exception as e:
+            print(f"API key check failed: {e}")
+
+    print(f"\n=== Setup complete! ===")
+    print("Auth strategy: API key for listing + Vertex AI (OAuth2) for generation")
+    print("Run 'python test_local.py' to test image/video generation.")
 
 
 if __name__ == "__main__":

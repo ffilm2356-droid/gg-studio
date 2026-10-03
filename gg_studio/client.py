@@ -52,6 +52,9 @@ GRPC_BASE = (
 )
 ORIGIN = "https://aistudio.google.com"
 
+VERTEX_LOCATION = "us-central1"
+VERTEX_API_BASE = f"https://{VERTEX_LOCATION}-aiplatform.googleapis.com/v1"
+
 POLL_INTERVAL = 5.0
 POLL_TIMEOUT = 600.0
 
@@ -103,6 +106,7 @@ class GoogleAIClient:
         self._force_backend = force_backend  # "public" or "grpc"
         self._oauth = OAuthTokenManager(account.cookies)
         self._oauth_token: str | None = None
+        self._gcp_project: str | None = None
 
     @property
     def _use_public_api(self) -> bool:
@@ -123,6 +127,58 @@ class GoogleAIClient:
             self._oauth_token = token
             logger.info("OAuth2 token acquired (%d chars)", len(token))
         return token
+
+    async def _detect_gcp_project(self) -> str:
+        """Auto-detect GCP project ID from OAuth2 token."""
+        if self._gcp_project:
+            return self._gcp_project
+        if not self._oauth_token:
+            raise APIError(401, "No OAuth2 token for GCP project detection.")
+        session = await self._get_session()
+        url = "https://cloudresourcemanager.googleapis.com/v1/projects?pageSize=100"
+        headers = {"Authorization": f"Bearer {self._oauth_token}"}
+        async with session.get(url, headers=headers) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise APIError(resp.status, f"Cannot list GCP projects: {text[:300]}")
+            data = json.loads(text)
+        projects = data.get("projects", [])
+        for p in projects:
+            pid = p.get("projectId", "")
+            if "generative" in pid.lower() and p.get("lifecycleState") == "ACTIVE":
+                self._gcp_project = pid
+                logger.info("Using GCP project: %s", pid)
+                return pid
+        for p in projects:
+            if p.get("lifecycleState") == "ACTIVE":
+                self._gcp_project = p["projectId"]
+                logger.info("Using GCP project: %s", self._gcp_project)
+                return self._gcp_project
+        raise APIError(404, "No active GCP project found. Visit console.cloud.google.com to create one.")
+
+    async def _vertex_api(
+        self, model: str, method: str, body: dict
+    ) -> dict:
+        """Call Vertex AI endpoint (uses cloud-platform scope OAuth2)."""
+        project = await self._detect_gcp_project()
+        vertex_model = model.replace("models/", "")
+        url = (
+            f"{VERTEX_API_BASE}/projects/{project}/locations/{VERTEX_LOCATION}"
+            f"/publishers/google/models/{vertex_model}:{method}"
+        )
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self._oauth_token}",
+        }
+        session = await self._get_session()
+        async with session.post(url, json=body, headers=headers) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise APIError(resp.status, text[:500], text)
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return {"raw": text}
 
     # ------------------------------------------------------------------
     # Headers
@@ -203,35 +259,44 @@ class GoogleAIClient:
     async def _public_api(
         self, model: str, method: str, body: dict
     ) -> dict:
-        """Call public Gemini API (OAuth2 Bearer or API key auth)."""
-        token = self._oauth_token
+        """Call generation API — tries API key first, falls back to Vertex AI."""
         key = _get_api_key()
+        token = self._oauth_token
 
-        if not token and not key:
+        if not key and not token:
             raise APIError(
                 401,
-                "No auth available. Run 'python setup_oauth.py' or set GEMINI_API_KEY.",
+                "No auth available. Set GEMINI_API_KEY or run 'python setup_oauth.py'.",
             )
 
-        if token:
-            url = f"{GEMINI_API_BASE}/{model}:{method}"
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {token}",
-            }
-        else:
+        # Try 1: API key on public Generative Language API
+        if key:
             url = f"{GEMINI_API_BASE}/{model}:{method}?key={key}"
             headers = {"Content-Type": "application/json"}
+            session = await self._get_session()
+            async with session.post(url, json=body, headers=headers) as resp:
+                text = await resp.text()
+                if resp.status < 400:
+                    try:
+                        return json.loads(text)
+                    except json.JSONDecodeError:
+                        return {"raw": text}
+                if token and resp.status in (429, 403):
+                    logger.info(
+                        "API key failed (HTTP %d), trying Vertex AI...",
+                        resp.status,
+                    )
+                else:
+                    raise APIError(resp.status, text[:500], text)
 
-        session = await self._get_session()
-        async with session.post(url, json=body, headers=headers) as resp:
-            text = await resp.text()
-            if resp.status >= 400:
-                raise APIError(resp.status, text[:500], text)
-            try:
-                return json.loads(text)
-            except json.JSONDecodeError:
-                return {"raw": text}
+        # Try 2: Vertex AI with OAuth2 cloud-platform scope
+        if token:
+            return await self._vertex_api(model, method, body)
+
+        raise APIError(
+            429,
+            "API key quota exceeded and no OAuth2 token for Vertex AI fallback.",
+        )
 
     # ------------------------------------------------------------------
     # Auth & utility
@@ -244,42 +309,37 @@ class GoogleAIClient:
     async def check_user_status(self) -> dict:
         if self._use_public_api:
             session = await self._get_session()
-            token = self._oauth_token
             key = _get_api_key()
-            if token:
-                url = f"{GEMINI_API_BASE}/models?pageSize=1"
-                headers = {"Authorization": f"Bearer {token}"}
-            elif key:
+            # Use API key for listing (OAuth2 cloud-platform scope doesn't cover this API)
+            if key:
                 url = f"{GEMINI_API_BASE}/models?key={key}&pageSize=1"
-                headers = {}
-            else:
-                raise APIError(401, "No auth available.")
-            async with session.get(url, headers=headers) as resp:
-                text = await resp.text()
-                if resp.status >= 400:
-                    raise APIError(resp.status, text[:500])
-                return json.loads(text)
+                async with session.get(url) as resp:
+                    text = await resp.text()
+                    if resp.status >= 400:
+                        raise APIError(resp.status, text[:500])
+                    return json.loads(text)
+            # No API key — try detecting GCP project as health check
+            if self._oauth_token:
+                project = await self._detect_gcp_project()
+                return {"status": "ok", "project": project, "auth": "vertex_ai"}
+            raise APIError(401, "No auth available.")
         return await self._rpc("CheckUserStatus", {})
 
     async def list_models(self) -> list[dict]:
         if self._use_public_api:
             session = await self._get_session()
-            token = self._oauth_token
             key = _get_api_key()
-            if token:
-                url = f"{GEMINI_API_BASE}/models"
-                headers = {"Authorization": f"Bearer {token}"}
-            elif key:
+            if key:
                 url = f"{GEMINI_API_BASE}/models?key={key}"
-                headers = {}
-            else:
-                raise APIError(401, "No auth available.")
-            async with session.get(url, headers=headers) as resp:
-                text = await resp.text()
-                if resp.status >= 400:
-                    raise APIError(resp.status, text[:500])
-                data = json.loads(text)
-                return data.get("models", [])
+                async with session.get(url) as resp:
+                    text = await resp.text()
+                    if resp.status >= 400:
+                        raise APIError(resp.status, text[:500])
+                    data = json.loads(text)
+                    return data.get("models", [])
+            if self._oauth_token:
+                return [{"name": "vertex-ai", "displayName": "Vertex AI (OAuth2)"}]
+            raise APIError(401, "No auth available.")
         resp = await self._rpc("ListModels", {})
         return resp.get("models", [])
 
@@ -633,19 +693,23 @@ class GoogleAIClient:
         return await self._poll_video_public(op_name)
 
     async def _poll_video_public(self, operation_name: str) -> bytes:
-        """Poll public API long-running operation."""
+        """Poll long-running operation (public API or Vertex AI)."""
         token = self._oauth_token
         key = _get_api_key()
+        is_vertex = operation_name.startswith("projects/")
         start = time.monotonic()
         session = await self._get_session()
 
         while time.monotonic() - start < POLL_TIMEOUT:
-            if token:
-                url = f"{GEMINI_API_BASE}/{operation_name}"
+            if is_vertex:
+                url = f"{VERTEX_API_BASE}/{operation_name}"
                 headers = {"Authorization": f"Bearer {token}"}
-            else:
+            elif key:
                 url = f"{GEMINI_API_BASE}/{operation_name}?key={key}"
                 headers = {}
+            else:
+                url = f"{GEMINI_API_BASE}/{operation_name}"
+                headers = {"Authorization": f"Bearer {token}"} if token else {}
             async with session.get(url, headers=headers) as resp:
                 text = await resp.text()
                 if resp.status >= 400:
