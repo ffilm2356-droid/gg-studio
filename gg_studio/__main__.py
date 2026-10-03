@@ -82,6 +82,12 @@ def generate(
 
         Path(output).mkdir(parents=True, exist_ok=True)
 
+        token = await client.ensure_oauth_token()
+        if token:
+            click.echo(f"OAuth2 token acquired ({len(token)} chars)")
+        else:
+            click.echo("No OAuth2 token — using fallback auth")
+
         try:
             if config["type"].value == "image":
                 click.echo(f"Generating image with {config['display']}...")
@@ -257,8 +263,13 @@ def check(accounts: str):
         for acc in accs:
             client = GoogleAIClient(acc, timeout=30.0)
             try:
-                await client._get_session()
-                click.echo(f"[OK] {acc.name} -- cookies loaded, proxy: {acc.proxy or 'none'}")
+                token = await client.ensure_oauth_token()
+                if token:
+                    click.echo(f"[OK] {acc.name} -- OAuth2 token acquired ({len(token)} chars)")
+                else:
+                    click.echo(f"[WARN] {acc.name} -- no OAuth2 token, trying cookie auth")
+                status = await client.check_user_status()
+                click.echo(f"[OK] {acc.name} -- API reachable, proxy: {acc.proxy or 'none'}")
             except Exception as e:
                 click.echo(f"[FAIL] {acc.name} -- {e}", err=True)
             finally:

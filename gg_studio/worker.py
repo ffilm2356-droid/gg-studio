@@ -85,6 +85,17 @@ class BatchWorker:
 
     async def start(self):
         self._running = True
+
+        for name, client in self._clients.items():
+            try:
+                token = await client.ensure_oauth_token()
+                if token:
+                    logger.info("OAuth2 token acquired for account '%s'", name)
+                else:
+                    logger.warning("No OAuth2 token for account '%s' — will use cookie auth", name)
+            except Exception as e:
+                logger.warning("OAuth2 setup failed for '%s': %s", name, e)
+
         num_workers = min(self.config.max_workers, len(self.accounts) * 10)
         logger.info("Starting %d workers across %d accounts", num_workers, len(self.accounts))
 

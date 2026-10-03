@@ -45,7 +45,8 @@ _TOKEN_CACHE = Path(".oauth_token.json")
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    redirects: list[str] = []
+    def __init__(self):
+        self.redirects: list[str] = []
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         self.redirects.append(newurl)

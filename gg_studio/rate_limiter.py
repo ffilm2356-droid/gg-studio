@@ -12,10 +12,10 @@ from .models import GenerationType
 class RateLimiter:
     """Per-account rate limiter with separate image/video RPM."""
 
-    def __init__(self, image_rpm: int = 25, video_rpm: int = 5, window: float = 70.0):
+    def __init__(self, image_rpm: int = 25, video_rpm: int = 5, wait_window: float = 70.0, **_kw):
         self.image_rpm = image_rpm
         self.video_rpm = video_rpm
-        self.window = window
+        self.window = wait_window
         self._timestamps: dict[str, list[float]] = defaultdict(list)
         self._lock = asyncio.Lock()
 
