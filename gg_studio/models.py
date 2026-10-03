@@ -10,10 +10,12 @@ from typing import Optional
 class ModelType(str, enum.Enum):
     NARWHAL_FLASH = "narwhal"
     GEMINI_3_PRO = "gemini3pro"
+    GEMINI_31_FLASH = "gemini31flash"
     IMAGEN_4 = "imagen4"
     IMAGEN_3 = "imagen3"
     VEO_3 = "veo3"
     VEO_2 = "veo2"
+    VEO_31_LITE = "veo31lite"
 
 
 class GenerationType(str, enum.Enum):
@@ -46,10 +48,18 @@ MODEL_CONFIG: dict[str, dict] = {
         "supports_reference": True,
     },
     ModelType.GEMINI_3_PRO: {
-        "display": "Gemini Flash Image",
+        "display": "Gemini 3 Pro Image",
         "type": GenerationType.IMAGE,
         "api_model_id": "models/gemini-2.5-flash-preview-image-generation",
-        "public_model_id": "models/gemini-2.5-flash-image",
+        "public_model_id": "models/gemini-3-pro-image",
+        "endpoint": "generate_content",
+        "supports_reference": True,
+    },
+    ModelType.GEMINI_31_FLASH: {
+        "display": "Gemini 3.1 Flash Image",
+        "type": GenerationType.IMAGE,
+        "api_model_id": "models/gemini-2.5-flash-preview-image-generation",
+        "public_model_id": "models/gemini-3.1-flash-image",
         "endpoint": "generate_content",
         "supports_reference": True,
     },
@@ -80,6 +90,14 @@ MODEL_CONFIG: dict[str, dict] = {
         "type": GenerationType.VIDEO,
         "api_model_id": "models/veo-2.0-generate-001",
         "public_model_id": "models/veo-3.1-fast-generate-preview",
+        "endpoint": "generate_video",
+        "supports_reference": False,
+    },
+    ModelType.VEO_31_LITE: {
+        "display": "Veo 3.1 Lite",
+        "type": GenerationType.VIDEO,
+        "api_model_id": "models/veo-2.0-generate-001",
+        "public_model_id": "models/veo-3.1-lite-generate-preview",
         "endpoint": "generate_video",
         "supports_reference": False,
     },
