@@ -144,24 +144,19 @@ def main():
     else:
         print("WARNING: No refresh token — you may need to re-run this later")
 
-    print("\nValidating token with MakerSuiteService...")
-    grpc_url = (
-        "https://alkalimakersuite-pa.clients6.google.com"
-        "/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService"
-        "/CheckUserStatus"
-    )
+    print("\nValidating token with Generative Language API...")
+    api_url = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=3"
     try:
-        req = urllib.request.Request(
-            grpc_url, data=b"{}", method="POST"
-        )
+        req = urllib.request.Request(api_url)
         req.add_header("Authorization", f"Bearer {access_token}")
-        req.add_header("Content-Type", "application/json")
-        req.add_header("X-Goog-Authuser", "0")
 
         resp = urllib.request.urlopen(req, timeout=15)
         body = resp.read().decode()
-        print(f"CheckUserStatus: OK! ({len(body)} bytes)")
+        data = json.loads(body)
+        models = [m.get("displayName", m.get("name", "")) for m in data.get("models", [])]
+        print(f"API OK! Found models: {', '.join(models[:3])}...")
         print(f"\n=== Setup complete! Token is working. ===")
+        print("Run 'python test_local.py' to test image/video generation.")
     except Exception as e:
         print(f"Validation failed: {e}")
         print("The token was obtained but may not have the right permissions.")

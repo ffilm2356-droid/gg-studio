@@ -69,9 +69,9 @@ async def main():
                 os.environ["AISTUDIO_API_KEY"] = line.split("=", 1)[1].strip()
                 break
 
-    client = GoogleAIClient(account, force_backend="grpc")
+    client = GoogleAIClient(account)
 
-    print("=== Testing MakerSuiteService (OAuth2 + gRPC) ===")
+    print("=== Testing Google AI Studio API ===")
     print()
 
     print("[0] Acquiring OAuth2 token...")

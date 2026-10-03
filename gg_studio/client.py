@@ -1,14 +1,13 @@
-"""Core API client — triple-backend for Google AI Studio.
+"""Core API client for Google AI Studio.
 
-Backend 1 (grpc + OAuth2): MakerSuiteService gRPC-web at
+Backend 1 (public + OAuth2): Public Gemini API at generativelanguage.googleapis.com
+  - With OAuth2 Bearer token: bypasses free-tier quota limits
+  - With API key only: subject to free-tier quota (may be 0 for image gen)
+
+Backend 2 (grpc): MakerSuiteService gRPC-web at
   alkalimakersuite-pa.clients6.google.com
-  - Requires OAuth2 access token (obtained from session cookies)
-  - Full access to all models including Imagen 4, Veo 3
-
-Backend 2 (public): Public Gemini API at generativelanguage.googleapis.com
-  - Works everywhere, requires API key
-  - Set AISTUDIO_API_KEY or GEMINI_API_KEY env var
-  - May have quota limits on free tier
+  - Internal API, requires first-party OAuth2 token + cookies
+  - Fallback when forced via force_backend="grpc"
 
 The client auto-acquires OAuth2 tokens from cookies when possible.
 """
@@ -112,7 +111,7 @@ class GoogleAIClient:
         if self._force_backend == "public":
             return True
         if self._oauth_token:
-            return False
+            return True
         return bool(_get_api_key())
 
     async def ensure_oauth_token(self) -> str | None:
@@ -204,15 +203,27 @@ class GoogleAIClient:
     async def _public_api(
         self, model: str, method: str, body: dict
     ) -> dict:
-        """Call public Gemini API (API key auth)."""
+        """Call public Gemini API (OAuth2 Bearer or API key auth)."""
+        token = self._oauth_token
         key = _get_api_key()
-        if not key:
-            raise APIError(401, "No API key set. Set GEMINI_API_KEY or AISTUDIO_API_KEY env var.")
 
-        url = f"{GEMINI_API_BASE}/{model}:{method}?key={key}"
+        if not token and not key:
+            raise APIError(
+                401,
+                "No auth available. Run 'python setup_oauth.py' or set GEMINI_API_KEY.",
+            )
+
+        if token:
+            url = f"{GEMINI_API_BASE}/{model}:{method}"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+            }
+        else:
+            url = f"{GEMINI_API_BASE}/{model}:{method}?key={key}"
+            headers = {"Content-Type": "application/json"}
+
         session = await self._get_session()
-        headers = {"Content-Type": "application/json"}
-
         async with session.post(url, json=body, headers=headers) as resp:
             text = await resp.text()
             if resp.status >= 400:
@@ -232,15 +243,38 @@ class GoogleAIClient:
 
     async def check_user_status(self) -> dict:
         if self._use_public_api:
-            return await self._public_api("models", "list", {})
+            session = await self._get_session()
+            token = self._oauth_token
+            key = _get_api_key()
+            if token:
+                url = f"{GEMINI_API_BASE}/models?pageSize=1"
+                headers = {"Authorization": f"Bearer {token}"}
+            elif key:
+                url = f"{GEMINI_API_BASE}/models?key={key}&pageSize=1"
+                headers = {}
+            else:
+                raise APIError(401, "No auth available.")
+            async with session.get(url, headers=headers) as resp:
+                text = await resp.text()
+                if resp.status >= 400:
+                    raise APIError(resp.status, text[:500])
+                return json.loads(text)
         return await self._rpc("CheckUserStatus", {})
 
     async def list_models(self) -> list[dict]:
         if self._use_public_api:
-            key = _get_api_key()
             session = await self._get_session()
-            url = f"{GEMINI_API_BASE}/models?key={key}"
-            async with session.get(url) as resp:
+            token = self._oauth_token
+            key = _get_api_key()
+            if token:
+                url = f"{GEMINI_API_BASE}/models"
+                headers = {"Authorization": f"Bearer {token}"}
+            elif key:
+                url = f"{GEMINI_API_BASE}/models?key={key}"
+                headers = {}
+            else:
+                raise APIError(401, "No auth available.")
+            async with session.get(url, headers=headers) as resp:
                 text = await resp.text()
                 if resp.status >= 400:
                     raise APIError(resp.status, text[:500])
@@ -600,13 +634,19 @@ class GoogleAIClient:
 
     async def _poll_video_public(self, operation_name: str) -> bytes:
         """Poll public API long-running operation."""
+        token = self._oauth_token
         key = _get_api_key()
         start = time.monotonic()
         session = await self._get_session()
 
         while time.monotonic() - start < POLL_TIMEOUT:
-            url = f"{GEMINI_API_BASE}/{operation_name}?key={key}"
-            async with session.get(url) as resp:
+            if token:
+                url = f"{GEMINI_API_BASE}/{operation_name}"
+                headers = {"Authorization": f"Bearer {token}"}
+            else:
+                url = f"{GEMINI_API_BASE}/{operation_name}?key={key}"
+                headers = {}
+            async with session.get(url, headers=headers) as resp:
                 text = await resp.text()
                 if resp.status >= 400:
                     raise APIError(resp.status, text[:500])
@@ -690,7 +730,12 @@ class GoogleAIClient:
 
     async def _download_uri(self, uri: str) -> bytes:
         session = await self._get_session()
-        headers = self._build_grpc_headers() if not self._use_public_api else {}
+        if not self._use_public_api:
+            headers = self._build_grpc_headers()
+        elif self._oauth_token:
+            headers = {"Authorization": f"Bearer {self._oauth_token}"}
+        else:
+            headers = {}
         async with session.get(uri, headers=headers) as resp:
             if resp.status >= 400:
                 raise APIError(resp.status, f"Failed to download from {uri}")
