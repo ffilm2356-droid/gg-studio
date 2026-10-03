@@ -33,10 +33,7 @@ _GCLOUD_CLIENT_ID = (
 )
 _GCLOUD_CLIENT_SECRET = "d-FL95Q19q7MQmFpd7hHD0Ty"
 
-_SCOPES = (
-    "https://www.googleapis.com/auth/cloud-platform "
-    "https://www.googleapis.com/auth/generative-language"
-)
+_SCOPES = "https://www.googleapis.com/auth/cloud-platform"
 
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "

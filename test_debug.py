@@ -161,10 +161,7 @@ def try_oauth2_code_flow(cookies):
 
     params = urllib.parse.urlencode({
         "client_id": client_id,
-        "scope": (
-            "https://www.googleapis.com/auth/cloud-platform "
-            "https://www.googleapis.com/auth/generative-language"
-        ),
+        "scope": "https://www.googleapis.com/auth/cloud-platform",
         "response_type": "code",
         "redirect_uri": redirect_uri,
         "prompt": "none",

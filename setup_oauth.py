@@ -23,10 +23,7 @@ CLIENT_ID = (
     ".apps.googleusercontent.com"
 )
 CLIENT_SECRET = "d-FL95Q19q7MQmFpd7hHD0Ty"
-SCOPES = (
-    "https://www.googleapis.com/auth/cloud-platform "
-    "https://www.googleapis.com/auth/generative-language"
-)
+SCOPES = "https://www.googleapis.com/auth/cloud-platform"
 
 
 def _find_free_port() -> int:
